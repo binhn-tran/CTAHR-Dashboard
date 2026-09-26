@@ -78,6 +78,14 @@ function parseNoncommGeoJSON(geojson: GeoJSON): DataRow[] {
     .filter((r: DataRow) => r.exchange_value > 0);
 }
 
+/*******************
+ * Returns rows like this:
+ * 
+ * [{year: <year>, county: <county>, area_id: <area_id>, species_group: <species_group>, ecosystem_type: <ecosystem_type>, exchange_value: <exchange_value>}, 
+ * {year: <year>, county: <county>, area_id: <area_id>, species_group: <species_group>, ecosystem_type: <ecosystem_type>, exchange_value: <exchange_value>}, {...}, ...]
+ * 
+ ************************/
+
 function parseCommGeoJSON(geojson: GeoJSON): DataRow[] {
   const rows: DataRow[] = [];
   for (const feat of geojson.features) {
@@ -91,7 +99,9 @@ function parseCommGeoJSON(geojson: GeoJSON): DataRow[] {
 
     for (let i = 0; i < years.length; i++) {
       const val = Number(values[i]) || 0;
-      if (val <= 0) continue;
+      if (val <= 0 || species[i] === "All Species" || ecosystems[i] === "All Ecosystems") continue;
+      // to prevent double counting, we skip rows that are "All Species" or "All Ecosystems." These values are broken down by specific species and specific ecosystems, which we could use to tally up.
+      
       rows.push({
         year: Number(years[i]),
         county,
@@ -277,7 +287,7 @@ export default function EcosystemDashboard({ geoJsonPath, datasetLabel }: Dashbo
         fetch(
           dataset === "noncomm"
             ? "/fisheriesdata/20260216_tidied_noncomm_ev.geojson"
-            : "/fisheriesdata/20260126_comm_ev_byMoku.geojson"
+            : "/fisheriesdata/comm_EV_byCatchmentArea_09182026.geojson"
         ),
       ]);
 
@@ -288,11 +298,19 @@ export default function EcosystemDashboard({ geoJsonPath, datasetLabel }: Dashbo
           ? parseNoncommGeoJSON(dataGeo)
           : parseCommGeoJSON(dataGeo);
 
+      // const rows = parseCommGeoJSON(dataGeo);
+
       setGeoData(dataset === "comm" ? dataGeo : geo);
       setRowData(rows);
 
       const speciesValues = [...new Set(rows.map((r) => r.species_group))].sort();
       const ecoValues = [...new Set(rows.map((r) => r.ecosystem_type))].sort();
+
+      // because we excluded "All Species" and "All Ecosystems" when creating rowData, we need to add them back in for the pickDefault function below.
+
+      speciesValues.unshift("All Species");
+      ecoValues.unshift("All Ecosystems");
+
       const pickDefault = (values: string[], aggregateLabel: string) =>
         values.includes(aggregateLabel) ? aggregateLabel : values[0] ?? "";
 
@@ -349,19 +367,24 @@ export default function EcosystemDashboard({ geoJsonPath, datasetLabel }: Dashbo
   const speciesGroups = [...new Set(rowData.map((d) => d.species_group))].sort();
   const ecosystemTypes = [...new Set(rowData.map((d) => d.ecosystem_type))].sort();
 
-  const filteredRows = rowData.filter((row) => {
+  // because we excluded "All Species" and "All Ecosystems" when creating rowData, we need to add them back in for filter dropdowns.
+  speciesGroups.unshift("All Species");
+  ecosystemTypes.unshift("All Ecosystems");
+
+  const filteredFisheryRows = rowData.filter((row) => {
     return (
       (selectedYearStart === null || row.year >= selectedYearStart) &&
       (selectedYearEnd === null || row.year <= selectedYearEnd) &&
       (selectedCounty === "" || row.county === selectedCounty) &&
-      (selectedSpecies === "" || row.species_group === selectedSpecies) &&
-      (selectedEcosystem === "" || row.ecosystem_type === selectedEcosystem)
+      // when it's "All Species" or "All Ecosystems", the code "short circuits" and returns all species rows and/or ecosystem rows.
+      (selectedSpecies === "All Species" || row.species_group === selectedSpecies) &&
+      (selectedEcosystem === "All Ecosystems" || row.ecosystem_type === selectedEcosystem)
     );
   });
 
-  const totalsById: Record<string, number> = {};
-  filteredRows.forEach((row) => {
-    totalsById[row.area_id] = (totalsById[row.area_id] || 0) + row.exchange_value;
+  const filteredTotalsById: Record<string, number> = {};
+  filteredFisheryRows.forEach((row) => {
+    filteredTotalsById[row.area_id] = (filteredTotalsById[row.area_id] || 0) + row.exchange_value;
   });
 
   const aggregatedGeoJSON = {
@@ -375,7 +398,7 @@ export default function EcosystemDashboard({ geoJsonPath, datasetLabel }: Dashbo
           ...feature,
           properties: {
             ...feature.properties,
-            total_exchange_value: totalsById[key] || 0,
+            total_exchange_value: filteredTotalsById[key] || 0,
           },
         };
       })
@@ -471,6 +494,7 @@ export default function EcosystemDashboard({ geoJsonPath, datasetLabel }: Dashbo
 
   // Stable color scale thresholds — computed from ALL data, not filtered,
   // so polygon colors don't shift when filters change.
+  /* As of 9/24/26, not in use. The dynamic color scale thresholds (computeColorThresholds) are used below. */
   const stableColorThresholds = (() => {
     if (layer === "extents") {
       // Build full moku+realm totals from ALL extents rows (no filter)
@@ -485,12 +509,8 @@ export default function EcosystemDashboard({ geoJsonPath, datasetLabel }: Dashbo
         allTotals[key] = (allTotals[key] || 0) + row.area_km2;
       });
       const sorted = Object.values(allTotals).sort((a, b) => a - b);
-      return {
-        q1: sorted[Math.floor(sorted.length * 0.2)] || 0,
-        q2: sorted[Math.floor(sorted.length * 0.4)] || 0,
-        q3: sorted[Math.floor(sorted.length * 0.6)] || 0,
-        q4: sorted[Math.floor(sorted.length * 0.8)] || 0,
-      };
+      return [sorted[Math.floor(sorted.length*0.1)], sorted[Math.floor(sorted.length*0.9)]];
+
     } else {
       // Build full moku/county totals from ALL fisheries rows (no filter)
       const allTotals: Record<string, number> = {};
@@ -498,14 +518,19 @@ export default function EcosystemDashboard({ geoJsonPath, datasetLabel }: Dashbo
         allTotals[row.area_id] = (allTotals[row.area_id] || 0) + row.exchange_value;
       });
       const sorted = Object.values(allTotals).sort((a, b) => a - b);
-      return {
-        q1: sorted[Math.floor(sorted.length * 0.2)] || 0,
-        q2: sorted[Math.floor(sorted.length * 0.4)] || 0,
-        q3: sorted[Math.floor(sorted.length * 0.6)] || 0,
-        q4: sorted[Math.floor(sorted.length * 0.8)] || 0,
-      };
+      return [sorted[Math.floor(sorted.length*0.1)], sorted[Math.floor(sorted.length*0.9)]];
     }
   })();
+
+  const computedColorThresholds = (() => {
+    const sorted = Object.values(filteredTotalsById).sort((a, b) => a - b);
+    const percent5 = Math.round(sorted[Math.floor(sorted.length * 0.05)])
+    const percent95 = Math.round(sorted[Math.floor(sorted.length * 0.95)])
+
+    const res: [number, number] = [percent5, percent95]
+
+    return res;
+  }) ();
 
   // ----------------------------------
   // Download helpers
@@ -544,13 +569,13 @@ export default function EcosystemDashboard({ geoJsonPath, datasetLabel }: Dashbo
 
     if (mode === "ONE_COUNTY") {
       if (!county) return;
-      const csv = buildCsvFromRows(filteredRows.filter((r) => r.county === county));
+      const csv = buildCsvFromRows(filteredFisheryRows.filter((r) => r.county === county));
       triggerCsvDownload(`${[dataset, safe(county), ...base].join("_")}.csv`, csv);
       return;
     }
 
     const grouped: Record<string, DataRow[]> = {};
-    filteredRows.forEach((r) => {
+    filteredFisheryRows.forEach((r) => {
       (grouped[r.county || "Unknown"] ||= []).push(r);
     });
     Object.entries(grouped).forEach(([c, rows], i) => {
@@ -604,7 +629,7 @@ export default function EcosystemDashboard({ geoJsonPath, datasetLabel }: Dashbo
   // Viz panel data
   // ----------------------------------
   const panelRows = selectedArea
-    ? filteredRows.filter((r) => r.area_id === selectedArea)
+    ? filteredFisheryRows.filter((r) => r.area_id === selectedArea)
     : [];
 
   const byYear: Record<number, number> = {};
@@ -737,6 +762,8 @@ export default function EcosystemDashboard({ geoJsonPath, datasetLabel }: Dashbo
     ? Math.max(...extentsChangeEntries.map((c) => Math.abs(c.delta)), 1)
     : 1;
 
+
+
   return (
     <div className="dashboard-container">
 
@@ -748,7 +775,16 @@ export default function EcosystemDashboard({ geoJsonPath, datasetLabel }: Dashbo
       />
 
       {/* Map */}
-      <div className="map-wrapper">
+      <div className="central-panel">
+        <div className="summary-display">
+          {(layer === "fisheries") ? (
+            <p>{(dataset == "comm") ? "Commercial" : "Non-commercial"} fisheries data, with <span className="summary-highlight">{(selectedSpecies === "All Species") ? "ALL" : selectedSpecies.toLocaleLowerCase()}</span> species and <span className="summary-highlight">{(selectedEcosystem === "All Ecosystems") ? "ALL" : selectedEcosystem.toLocaleLowerCase()}</span> ecosystems: {selectedYearStart || years[0]}-{selectedYearEnd || years[years.length-1]}</p>
+          ) : (
+            <p>Ecosystem extents data, with <span className="summary-highlight">{(selectedExtentsEcosystem === "") ? "ALL" : selectedExtentsEcosystem.toLocaleLowerCase()}</span> ecosystems: {selectedYearStart || years[0]}-{selectedYearEnd || years[years.length-1]}</p>
+          )}
+          
+        </div>
+
         <Map
           mapType={dataset}
           layerType={layer}
@@ -759,10 +795,14 @@ export default function EcosystemDashboard({ geoJsonPath, datasetLabel }: Dashbo
           selectedSpecies={selectedSpecies}
           selectedEcosystem={layer === "extents" ? selectedExtentsEcosystem : selectedEcosystem}
           onCountyClick={handleAreaClick}
-          colorThresholds={stableColorThresholds}
+          outliers={computedColorThresholds}
         />
-      </div>
 
+        <div style={{ position: "absolute", left: "30%", top: "50%"}}>
+         
+        </div>
+      </div>
+      
       {/* Right panel */}
       <div className="right-panel">
 
